@@ -5,6 +5,7 @@
 #include "include/MumbleAPI_v_1_0_x.h"
 #include "include/MumblePlugin_v_1_0_x.h"
 
+#include <algorithm>
 #include <cstring>
 #include <String>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <thread>
 #include <windows.h>
+#include <unordered_map>
 
 #pragma comment(lib, "ws2_32.lib")
 using namespace std;
@@ -48,13 +50,23 @@ mumble_plugin_id_t ownID;
 //////////////////////////////////////////////////////////////
 // All of the following function must be implemented in order for Mumble to load the plugin
 
-const char* fstate = "unset\0";
-HANDLE hMapFile = nullptr;
-char* sharedText = nullptr;
+std::unordered_map<string, char*> mapWithMMF;
+std::list<HANDLE> hMapFiles;
 
-void CreateMemoryMappedFile() {
+string normalized_name(const char* userName) {
+	std::string normalizedUserName(userName);
+	std::transform(normalizedUserName.begin(), normalizedUserName.end(), normalizedUserName.begin(), ::tolower);
+	std::replace(normalizedUserName.begin(), normalizedUserName.end(), ' ', '_');
+	return normalizedUserName;
+}
+
+void CreateMemoryMappedFile(const char* userName) {
+	string normalizedName = normalized_name(userName);
+	string posaudioPrefix = "posaudio_mumlink_" + normalizedName;
+	string fileName = "%temp%\gtfo_" + posaudioPrefix;
+
 	HANDLE hFile = CreateFile(
-		"%temp%\gtfo_posaudio_mumlink",
+		fileName.c_str(),
 		GENERIC_READ | GENERIC_WRITE,
 		0,
 		NULL,
@@ -62,39 +74,40 @@ void CreateMemoryMappedFile() {
 		FILE_ATTRIBUTE_NORMAL,
 		NULL
 	);
-	hMapFile = CreateFileMapping(
+	HANDLE hMapFile = CreateFileMapping(
 		INVALID_HANDLE_VALUE,
 		nullptr,
 		PAGE_READWRITE,
 		0,
 		1024, // Size of the shared memory region for the string
-		"posaudio_mumlink"
+		posaudioPrefix.c_str()
 	);
 
-	sharedText = static_cast<char*>(MapViewOfFile(
+	char* text = static_cast<char*>(MapViewOfFile(
 		hMapFile,
 		FILE_MAP_WRITE,
 		0,
 		0,
 		1024
 	));
+	
+	mapWithMMF[normalizedName] = text;
+	hMapFiles.push_back(hMapFile);
 }
 
-void UpdateMemoryMappedFileContents(const std::string& data) {
-	if (sharedText) {
-		strncpy(sharedText, data.c_str(), 1024);
+void UpdateMemoryMappedFileContents(const std::string& state, const char* userName) {
+	string normalizedName = normalized_name(userName);
+	if (mapWithMMF.find(normalizedName) == mapWithMMF.end()) {
+		CreateMemoryMappedFile(userName);
+	}
+	if (mapWithMMF[normalizedName]) {
+		strncpy(mapWithMMF[normalizedName], state.c_str(), 1024);
 	}
 }
 
 mumble_error_t mumble_init(uint32_t id) {
 
-	std::thread serverThread(CreateMemoryMappedFile);
-	serverThread.detach(); // Allow the thread to run independently
-	//CreateMemoryMappedFile();
-
 	pluginLog("Initialized plugin");
-	UpdateMemoryMappedFileContents("unset");
-
 	ownID = id;
 
 	// Print the connection ID at initialization. If not connected to a server it should be -1.
@@ -121,10 +134,10 @@ mumble_error_t mumble_init(uint32_t id) {
 
 void mumble_shutdown() {
 	WSACleanup();
-	if (sharedText) {
-		UnmapViewOfFile(sharedText);
+	for (const auto& pair : mapWithMMF) {
+		UnmapViewOfFile(pair.second);
 	}
-	if (hMapFile) {
+	for (HANDLE hMapFile : hMapFiles) {
 		CloseHandle(hMapFile);
 	}
 	pluginLog("Shutdown plugin");
@@ -245,8 +258,14 @@ void mumble_onServerDisconnected(mumble_connection_t connection) {
 
 void mumble_onUserTalkingStateChanged(mumble_connection_t connection, mumble_userid_t userID, mumble_talking_state_t talkingState)
 {
+	const char* userName;
+	mumble_error_t getNameError = mumAPI.getUserName(ownID, connection, userID, &userName);
+	if (getNameError != MUMBLE_STATUS_OK) {
+		userName = "Unknown";
+		pluginLog("[ERROR]: mumble_onUserTalkingStateChanged - Unable to get user name");
+	}
 
-	// The possible values are contained in the TalkingState enum inside PluginComponent.h
+	const char* fstate;
 	switch (talkingState) {
 	case MUMBLE_TS_INVALID:
 		fstate = "Invalid\0";
@@ -267,6 +286,5 @@ void mumble_onUserTalkingStateChanged(mumble_connection_t connection, mumble_use
 		fstate = "Unknown\0";
 	}
 
-	UpdateMemoryMappedFileContents(fstate);
+	UpdateMemoryMappedFileContents(fstate, userName);
 }
-
